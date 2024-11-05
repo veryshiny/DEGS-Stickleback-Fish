@@ -1,0 +1,859 @@
+---
+title: "DeSeq2 Report"
+author: "Varsheni"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DESeq2)
+library(pheatmap)
+library(RColorBrewer)
+library("PoiClaClu")
+library("glmpca")
+library("ggbeeswarm")
+library("apeglm")
+library("ggforce")
+library("genefilter")
+library(gridExtra)
+library(plotly)
+library(manipulateWidget)
+library(grid)
+```
+
+# The FISHY data
+
+We are analyzing data from an experiment in which larval stickleback fish from two populations (Boot Lake “Bt” and Rabbit Slough “RS”) is exposed to one of two treatments: a conventional microbiota (“CV”) or germ-free (“GF”). RNA was isolated from the intestinal tracts of the experimental fish and used to make individual TruSeq mRNA-seq libraries. \
+
+We are interested in genes differentially expressed between fish of different populations and genes differentially expressed between fish exposed or unexposed to microbes.
+
+# Loading Data into DESeq2
+
+The counts data was generated using htseq-count  and is in the file Gacu_gut_counts.tsv. The metadata containing information about each sample (i.e. column in the counts file) can be found in Gacu_gut_metadata.tsv.
+We read each of these into R dataframes named countdata and coldata respectively.
+
+```{r,echo=F, include=FALSE}
+countdata <- read.delim("~/Bi623/Assignment_DESeq2/Gacu_gut_counts.tsv", header=FALSE, row.names=1)
+colnames(countdata) <-countdata[1,]
+countdata<-countdata[-1,]
+countdata<-dplyr::mutate_all(countdata, function(x) as.numeric(as.character(x)))
+
+coldata <- read.delim("~/Bi623/Assignment_DESeq2/Gacu_gut_metadata.tsv",row.names=1) 
+```
+
+We used DESeqDataSetFromMatrix() to load the countdata, coldata, and set up our multifactor design with (1) ~ Population + Sex + Treatment (PST) and (2) ~ Sex + Treatment (ST).
+
+```{r,echo=F, include=FALSE}
+
+ddsMat_PST <- DESeqDataSetFromMatrix(as.matrix(countdata), coldata,tidy = F,~ Population + Sex + Treatment)
+
+ddsMat_ST <- DESeqDataSetFromMatrix(as.matrix(countdata), coldata,tidy = F,~ Sex + Treatment)
+```
+
+Finally, we created our DESeq2 object for downstream analyses.
+
+```{r,echo=FALSE, include=FALSE}
+dds_PST<-DESeq(ddsMat_PST)
+dds_ST<-DESeq(ddsMat_ST)
+
+```
+
+# Steps in creating a DESeq object by DESeq2
+
+#### estimating size factors
+
+DESeq2 will model the raw counts, using normalization factors (size factors) to account for differences in library depth.
+
+#### estimating dispersions
+
+The DESeq2 dispersion estimates are inversely related to the mean and directly related to variance. Based on this relationship, the dispersion is higher for small mean counts and lower for large mean counts.
+
+To model the dispersion based on expression level (mean counts of replicates), the dispersion for each gene is estimated using maximum likelihood estimation. 
+
+#### gene-wise dispersion estimates
+
+DESeq2 assumes that genes with similar expression levels should have similar dispersion.
+
+#### mean-dispersion relationship & final dispersion estimates
+
+DESeq2 shrinks these estimates to generate more accurate estimates of dispersion to model the counts.
+
+#### fitting model and testing
+
+Finally, DESeq2 will fit the negative binomial model and perform hypothesis testing using the Wald test or Likelihood Ratio Test.
+
+# 2. Pre-filtering the dataset 
+
+We keep only genes with rowSums(counts(dds)) > 1. \
+
+The smallest group size for the PST design was 3, while the smallest group size for the ST design was 7. This was decided based on the smallest possible combination of the 3 (Population, Sex, Treatment) or 2 (Sex, Treatment) variables. \
+
+The genes removed during filtering were genes which did not have enough expression levels (enough counts) in enough samples as the smallest group size.\
+
+```{r, echo=F, include=FALSE}
+old_dds_nrows_PST<-nrow(dds_PST)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds_PST) > 1) >= smallestGroupSize
+dds_PST <- dds_PST[keep,]
+
+old_dds_nrows_PST-nrow(dds_PST)
+
+old_dds_nrows_ST<-nrow(dds_ST)
+smallestGroupSize <- 7
+keep <- rowSums(counts(dds_ST) > 1) >= smallestGroupSize
+dds_ST <- dds_ST[keep,]
+
+old_dds_nrows_ST-nrow(dds_ST)
+```
+
+2841 genes were removed for the PST (Population, Sex and Treatment) design. \
+3536 genes were removed for the ST (Sex and Treatment) design. \
+The total number of genes in the beginning was 22,456.\
+
+The increased removal of genes in the Sex and Treatment design as compared to the Population Sex and Treatment model, is explained by the bigger group size (group size = 7) in this model. Because the gene needs to be present in more samples than it had to previously (group size = 3). \
+
+# Per-gene dispersion estimates
+
+Diagnostic Plot showing the results of curve fit for both designs. Both models do a good job of fitting our data.
+
+```{r, fig.show="hold", out.width="50%",echo=F}
+
+plotDispEsts(dds_PST,main="Population-Sex-Treatment Design")
+plotDispEsts(dds_ST,main="Sex-Treatment Design")
+
+```
+
+# 3. Regularized Log (rlog) Transformation 
+
+We will use the rlog transformation method, transforming data blind to our experimental design. The rlog function transforms the count data to the log2 scale in a way which minimizes differences between samples for rows with small counts, and which normalizes with respect to library size. When we plot the regularised log counts, we'll see a Gaussian distribution.
+
+```{r,echo=F, include=FALSE}
+rld_PST <- rlog(dds_PST, blind = TRUE)
+
+rld_ST <- rlog(dds_ST, blind = TRUE)
+
+```
+
+The reason we use the rlog method is because the VST is less sensitive to high count outliers than the rlog. The rlog tends to work well on small datasets like ours with sample size 32.
+
+
+# 4. Generate sample distance heatmaps with dendrograms
+
+## Euclidean distance heatmap 
+
+We use the R function dist to calculate the Euclidean distance between samples. To ensure we have a roughly equal contribution from all genes, we use it on the rlog-transformed data. The Euclidean distance measures the uniform divergence between expression profiles, the higher the divergence the larger the distance is. \
+
+In the plots below, the darker blue the color is, the higher the divergence between the samples. Hence, we can see that the diagonal is white; because the divergence of a sample from itself is 0.
+
+```{r, fig.show="hold", out.width="50%",echo=F}
+
+sampleDists_PST <- dist(t(assay(rld_PST)))
+sampleDists_ST <- dist(t(assay(rld_ST)))
+poisd_PST <- PoissonDistance(t(counts(dds_PST)))
+poisd_ST <- PoissonDistance(t(counts(dds_ST)))
+
+sampleDistMatrix_PST <- as.matrix( sampleDists_PST )
+rownames(sampleDistMatrix_PST) <- paste(colnames(sampleDistMatrix_PST), dds_PST$Sex, dds_PST$Population,dds_PST$Treatment, sep = " - " )
+colnames(sampleDistMatrix_PST) <- paste(colnames(sampleDistMatrix_PST))
+colors <- colorRampPalette((brewer.pal(9, "Blues")) )(255)
+
+a <- pheatmap(sampleDistMatrix_PST,
+         clustering_distance_rows = sampleDists_PST,
+         clustering_distance_cols = sampleDists_PST,
+         col = colors,main="Euclidean distance Population-Sex-Treatment Heatmap",
+         fontsize = 8,cellwidth = 9,cellheight = 9)[[4]]
+
+sampleDistMatrix_ST <- as.matrix( sampleDists_ST )
+rownames(sampleDistMatrix_ST) <- paste(colnames(sampleDistMatrix_ST), dds_ST$Sex, dds_ST$Population,dds_ST$Treatment, sep = " - " )
+colnames(sampleDistMatrix_ST) <- paste(colnames(sampleDistMatrix_ST))
+colors <- colorRampPalette((brewer.pal(9, "Blues")) )(255)
+
+b <- pheatmap(sampleDistMatrix_ST,
+         clustering_distance_rows = sampleDists_ST,
+         clustering_distance_cols = sampleDists_ST,
+         col = colors,main="Euclidean distance Sex-Treatment Heatmap",
+         fontsize = 8,cellwidth = 9,cellheight = 9)[[4]]
+
+
+
+
+
+
+```
+
+
+## Poisson distance heatmap
+
+The Poisson distance takes the variance structure of counts into consideration when calculating the distances between samples. \
+
+In the plots below, the darker blue the color is, the higher the divergence between the samples. Hence, we can see that the diagonal is white; because the divergence of a sample from itself is 0.
+
+
+```{r, fig.show="hold", out.width="50%",echo=F}
+
+samplePoisDistMatrix_PST <- as.matrix( poisd_PST$dd )
+rownames(samplePoisDistMatrix_PST) <- rownames(sampleDistMatrix_PST)
+colnames(samplePoisDistMatrix_PST) <- colnames(sampleDistMatrix_PST)
+c<- pheatmap(samplePoisDistMatrix_PST,main="Poisson distance Population-Sex-Treatment Heatmap",
+         clustering_distance_rows = poisd_PST$dd,
+         clustering_distance_cols = poisd_PST$dd,
+         fontsize = 8,cellwidth = 9,cellheight = 9,
+         col = colors)[[4]]
+
+
+
+samplePoisDistMatrix_ST <- as.matrix( poisd_ST$dd )
+rownames(samplePoisDistMatrix_ST) <- rownames(sampleDistMatrix_ST)
+colnames(samplePoisDistMatrix_ST) <- colnames(sampleDistMatrix_ST)
+d <- pheatmap(samplePoisDistMatrix_ST,main="Poisson distance Sex-Treatment Heatmap",
+         clustering_distance_rows = poisd_ST$dd,
+         clustering_distance_cols = poisd_ST$dd,
+         fontsize = 8,cellwidth = 9,cellheight = 9,
+         col = colors)[[4]]
+```
+
+## What the plots are showing us
+
+* 5C_02 (F, RS, GF) seems like a potential outlier from all 4 plots above. 
+
+* The plots have hierarchical clustering of the samples based on the expression levels of their different genes. 
+
+* The groupings agree mostly, with the terminal sister nodes having the same samples in Euclidean vs Poisson for both designs. 
+
+* Between designs too, the groupings seem to be mostly conserved.
+
+* This also shows that the extra genes which were removed from the second reduced Sex + Treatment model does not change any clustering patterns, the samples are still quite the same as before.
+
+
+# 5. Generating PCA, Generalized PCA, and MDS plots 
+
+## PCA
+
+Principal component analysis is a statistical method for reducing a cases-by-variables data table to its essential features, called principal components. Principal components are a few linear combinations of the original variables that maximally explain the variance of all the variables.
+
+### Population-Sex-Treatment Design 
+
+We can see that there seems to be clustering of the 2 populations together, but this variance accounts for only 12% of the variance. The other 2 factors, Treatment and Sex don't seem to cluster significantly away from each other, there is an overlap between the 2 types of each category. 
+
+```{r,include=F, echo=F}
+pcaData_PST <- plotPCA(rld_PST, intgroup = c("Population","Treatment","Sex"), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData_PST, "percentVar"))
+```
+
+```{r, fig.width=12, fig.height=8, echo=F}
+a<- ggplot(pcaData_PST, aes(x = PC1, y = PC2, color = Treatment, shape=Population)) +
+  geom_point(size =2) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("Treatment and Population")
+
+b<- ggplot(pcaData_PST, aes(x = PC1, y = PC2, color =   Population, shape= Sex )) +
+  geom_point(size =2) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("Population and Sex")
+
+c<- ggplot(pcaData_PST, aes(x = PC1, y = PC2, color = Sex, shape=Treatment)) +
+  geom_point(size =2) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("Sex and Treatment")
+#+  ggforce::geom_mark_hull(aes(group = Population,fill = Population))
+
+grid.arrange(a, b,c, nrow = 2,top = textGrob("PCA of RLOG normalized data", gp=gpar(fontsize=20,font=3)))
+
+```
+
+
+###  Sex-Treatment Design 
+
+Treatment and Sex don't seem to cluster significantly away from each other, there is an overlap between the 2 types of each category. It looks exactly the same as the plot from the first design.
+
+```{r,include=F, echo=F}
+
+pcaData_ST <- plotPCA(rld_ST, intgroup = c("Treatment","Sex"), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData_ST, "percentVar"))
+```
+
+
+```{r, echo=F, fig.align='center' ,out.width="50%"}
+ggplot(pcaData_ST, aes(x = PC1, y = PC2, color = Sex, shape=Treatment)) +
+  geom_point(size =2) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed()  +
+  ggtitle("PCA of RLOG normalized data with Treatment and Sex (design ST)")
+
+
+
+
+
+```
+
+## GLM-PCA
+
+Generalized principal component analysis (GLM-PCA) facilitates dimension reduction of non-normally distributed data.
+
+```{r, echo=F}
+
+gpca_PST <- glmpca(counts(dds_PST), L=2)
+gpca_PST.dat <- gpca_PST$factors
+gpca_PST.dat$Population <- dds_PST$Population
+gpca_PST.dat$Treatment <- dds_PST$Treatment
+gpca_PST.dat$Sex <- dds_PST$Sex
+
+gpca_ST <- glmpca(counts(dds_ST), L=2)
+gpca_ST.dat <- gpca_ST$factors
+gpca_ST.dat$Treatment <- dds_ST$Treatment
+gpca_ST.dat$Sex <- dds_ST$Sex
+
+```
+
+
+### Population-Sex-Treatment Design 
+
+Treatment and Sex don't seem to cluster significantly away from each other, there is an overlap between the 2 types of each category. Population is a bit divided into a Bt and RS clusters, but there is still overlap. 
+
+
+```{r, fig.width=12, fig.height=8, echo=F}
+
+a <-ggplot(gpca_PST.dat, aes(x = dim1, y = dim2, color = Population, shape = Treatment)) +
+  geom_point(size =2) + coord_fixed() + ggtitle("Population and Treatment")
+
+c <-ggplot(gpca_PST.dat, aes(x = dim1, y = dim2, color = Sex, shape = Treatment)) +
+  geom_point(size =2) + coord_fixed() + ggtitle("Sex and Treatment")
+
+b <-ggplot(gpca_PST.dat, aes(x = dim1, y = dim2, color = Sex, shape = Population)) +
+  geom_point(size =2) + coord_fixed() + ggtitle("Population and Sex")
+
+d <-ggplot(gpca_ST.dat, aes(x = dim1, y = dim2, color = Sex, shape = Treatment)) +
+  geom_point(size =2) + coord_fixed() + ggtitle("GLM-PCA on un-normalised data: Sex and Treatment ")
+
+grid.arrange(a, b,c, nrow = 2,top = textGrob("GLM-PCA on un-normalised data", gp=gpar(fontsize=20,font=3))) 
+
+
+```
+
+###  Sex-Treatment Design 
+
+Treatment and Sex don't seem to cluster significantly away from each other, there is an overlap between the 2 types of each category. It looks exactly the same as the plot from the first design, but flipped twice horizontally and vertically. This plot is still showing us the same thing as the plot above.
+
+
+```{r, echo=F, fig.align='center',out.width="50%"}
+d
+```
+
+## MDS Plots
+
+MDS (Multidimensional Scaling) arranges the points on the plot so that the distances among each pair of points correlates as best as possible to the dissimilarity between those two samples. The values on the two axes tell you nothing about the variables for a given sample - the plot is just a two dimensional space to arrange the points. MDS focuses on preserving pairwise distances, while PCA focuses on capturing maximum variance in the data.
+
+#### Given the Euclidean Distance/Poisson Distances, we are trying to map our samples in such a way that the clusters they make up have distances between them that are as close to these Euclidean Distance/Poisson Distances as we can make them. We could only map them perfectly in n-dimensional space, so I am representing the two most informative dimensions here -- similar to what we do in the PCA plots above, with the two leading principal components.
+
+\
+
+### MDS Plot with Euclidean Distance
+
+
+#### Population-Sex-Treatment Design 
+
+Treatment and Sex don't seem to cluster significantly away from each other, there is an overlap between the 2 types of each category. Population is a bit divided into a Bt and RS clusters, but there is still overlap. Noticably, Bt seems to cluster a little bit together.
+
+```{r , fig.width=12, fig.height=8, echo=F}
+
+mds_PST <- as.data.frame(colData(rld_PST))  %>%
+         cbind(cmdscale(sampleDistMatrix_PST))
+a<- ggplot(mds_PST, aes(x = `1`, y = `2`, color = Population, shape = Treatment)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("Population and Treatment")
+
+b<-ggplot(mds_PST, aes(x = `1`, y = `2`, color = Sex, shape = Treatment)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("Sex and Treatment")
+
+c<-ggplot(mds_PST, aes(x = `1`, y = `2`, color = Sex, shape = Population)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("Population and Sex")
+
+grid.arrange(a, c,b, nrow = 2,top = textGrob("MDS Plot with RLOG normalized data", gp=gpar(fontsize=20,font=3)))
+
+
+```
+
+#### Sex-Treatment Design 
+
+Treatment and Sex don't seem to cluster significantly away from each other, there is an overlap between the 2 types of each category. It looks exactly the same as the plot from the first design.
+
+
+```{r, echo=F, fig.align='center',out.width="50%"}
+
+mds_ST <- as.data.frame(colData(rld_ST))  %>%
+         cbind(cmdscale(sampleDistMatrix_ST))
+
+d<-ggplot(mds_ST, aes(x = `1`, y = `2`, color = Sex, shape = Treatment)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("MDS with RLOG normalized data: Treatment and Sex")
+
+d
+
+```
+
+### MDS Plot with Poisson Distance
+
+
+#### Population-Sex-Treatment Design 
+
+Treatment and Sex don't seem to cluster significantly away from each other, there is an overlap between the 2 types of each category. Population is a bit divided into a Bt and RS clusters, but there is still overlap.
+
+```{r , fig.width=12, fig.height=8,echo=F}
+
+mdsPois_PST <- as.data.frame(colData(dds_PST)) %>%
+   cbind(cmdscale(samplePoisDistMatrix_PST))
+
+a<- ggplot(mdsPois_PST, aes(x = `1`, y = `2`, color = Population, shape = Treatment)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("Population and Treatment")
+
+b<- ggplot(mdsPois_PST, aes(x = `1`, y = `2`, color = Treatment, shape = Sex)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("Treatment and Sex")
+
+c<- ggplot(mdsPois_PST, aes(x = `1`, y = `2`, color = Sex, shape = Population)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("Sex and Population")
+
+grid.arrange(a,c,b, nrow = 2,top = textGrob("MDS with Poisson Distances", gp=gpar(fontsize=20,font=3)))
+
+```
+
+#### Sex-Treatment Design 
+
+Treatment and Sex don't seem to cluster significantly away from each other, there is an overlap between the 2 types of each category.
+
+```{r, echo=F,fig.align='center',out.width="50%"}
+
+mdsPois_ST <- as.data.frame(colData(dds_ST)) %>%
+   cbind(cmdscale(samplePoisDistMatrix_ST))
+
+ggplot(mdsPois_ST, aes(x = `1`, y = `2`, color = Treatment, shape = Sex)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("MDS with Poisson Distances: Treatment and Sex")
+
+
+
+```
+
+## Overall PCA takebacks
+
+Between designs, the PCA plot doesn't seem to vary at all. This is because the data is still largely the same. This also shows that the extra genes which were removed from the second reduced Sex + Treatment model does not change any clustering patterns.
+
+## Which Plot shows the least appropriate visualisation 
+
+MDS and PCA are probably not at the same level to be in line or opposite to each other. PCA is just a method while MDS is a class of analysis. As mapping, PCA is a particular case of MDS. On the other hand, PCA is a particular case of Factor analysis which, being a data reduction, is more than only a mapping, while MDS is only a mapping.\
+
+In my opinion, the first PCA plots (not generalized PCA) are the least appropriate one for our data. The PCA seems to indicate that there in a difference in Population groups, but the variance attached to the difference only accounts for 12% of the total variation. This is a preliminary analysis, and looking at only the PCA plots, without having all the others we have above, could give us a biased perception. These plots are for diagnostic purposes, to see what we're getting into in further analyses.
+
+\
+
+# 6 Generate a results table
+
+For each contrast, the number of genes with p-value of < 0.1 :
+
+ Contrast            PST      ST
+------------------ -------  -------   
+ Treatment           1890     1639 
+ Sex                 3086     2688 
+ Population          7400       -
+
+
+For each contrast, the number of genes with p-adjusted-value of < 0.1 :
+
+
+  Contrast      PST     ST
+------------- ------- ------    
+ Treatment        74    48
+ Sex             662   592 
+ Population     4671    - 
+
+It looks like Population is the group which has the most significantly variant genes. \
+
+Treatment has the least.\
+
+Differences between PST and ST models is explained below later.\
+
+## Summary for PST Design
+
+*For Population*
+
+out of 19615 with nonzero total read count \
+adjusted p-value < 0.1 \
+LFC > 0 (up)       : 2226, 11% \
+LFC < 0 (down)     : 2445, 12% \
+outliers [1]       : 123, 0.63% \
+low counts [2]     : 0, 0% \
+(mean count < 0) \
+
+*For Treatment*
+
+out of 19615 with nonzero total read count \
+adjusted p-value < 0.1 \
+LFC > 0 (up)       : 67, 0.34% \ 
+LFC < 0 (down)     : 7, 0.036% \
+outliers [1]       : 123, 0.63% \
+low counts [2]     : 380, 1.9% \
+(mean count < 1) \
+
+*For Sex*
+
+out of 19615 with nonzero total read count \
+adjusted p-value < 0.1 \
+LFC > 0 (up)       : 141, 0.72% \
+LFC < 0 (down)     : 521, 2.7% \
+outliers [1]       : 123, 0.63% \
+low counts [2]     : 758, 3.9% \
+(mean count < 1) \
+
+## Subsetted data of just genes with padj <0.1
+
+```{r, echo=F, include=FALSE}
+
+res_S <- results(dds_PST,contrast = c("Sex","M","F"))
+subset_res_S <-subset(res_S,res_S$padj<0.1)
+table(res_S$pvalue<0.1,dnn="pvalue") #3086 
+
+res_T <- results(dds_PST,contrast = c("Treatment","GF","CV"))
+subset_res_T <-subset(res_T,res_T$padj<0.1)
+table(res_T$pvalue<0.1) #1890 
+head(subset_res_T)
+
+res_P <- results(dds_PST,contrast = c("Population","Bt","RS"))
+subset_res_P <-subset(res_P,res_P$padj<0.1)
+table(res_P$pvalue<0.1) #7400 
+
+res_S_st <- results(dds_ST,contrast = c("Sex","M","F"))
+subset_res_S_st <-subset(res_S_st,res_S_st$padj<0.1)
+table(res_S_st$pvalue<0.1) #2688
+```
+
+```{r, echo=F}
+head(subset_res_T)
+```
+
+## Summary for ST Design
+
+
+*Treatment*
+
+out of 18920 with nonzero total read count \
+adjusted p-value < 0.1 \
+LFC > 0 (up)       : 2, 0.011% \
+LFC < 0 (down)     : 46, 0.24% \
+outliers [1]       : 0, 0% \
+low counts [2]     : 0, 0% \
+(mean count < 1) \
+
+*Sex*
+
+out of 18920 with nonzero total read count \
+adjusted p-value < 0.1 \
+LFC > 0 (up)       : 121, 0.64% \
+LFC < 0 (down)     : 471, 2.5% \
+outliers [1]       : 0, 0% \
+low counts [2]     : 0, 0% \
+(mean count < 1) \
+
+## Subsetted data of just genes with padj <0.1
+
+```{r, echo=F, include = F}
+res_T_st <- results(dds_ST,contrast = c("Treatment","GF","CV"))
+subset_res_T_st <- subset(res_T_st,res_T_st$padj<0.1)
+table(res_T_st$pvalue<0.1) #1639
+
+
+```
+
+```{r, echo=F}
+head(subset_res_T_st)
+```
+ 
+\ 
+
+# Description of Each Column of the results table
+
+ 
+### baseMean: 
+
+The first column, baseMean, is the average of the normalized count values, dividing by size factors, taken over all samples
+ 
+### log2FoldChange:
+
+The column log2FoldChange is the effect size estimate. It tells us how much the gene’s expression seems to have changed between the contrasts we're looking at.
+
+### lfcSE:   
+ 
+log2FoldChange has an uncertainty associated with it, which is available in the column lfcSE, the standard error estimate for the log2 fold change estimate.
+ 
+### stat:
+
+The statistic from the Wald test used to generate the p-value.
+ 
+### pvalue:  
+ 
+Wald test p-value for the contrast we were looking at. A p value indicates the probability that a fold change as strong as the observed one, or even stronger, would be seen under the situation described by the null hypothesis.
+ 
+### padj:
+
+The adjusted p values satisfy the property that thresholding at a specific value defines a set of tests (one for each gene) with a bounded false discovery rate (FDR), typically a useful metric for assessing which genes to target for further analysis. 
+
+\
+
+# 7. Downstream Analyses
+
+
+```{r,fig.align='center', echo=F,include=F}
+
+topGene_S <- rownames(subset_res_S)[which.min(subset_res_S$padj)]
+topGene_P <- rownames(subset_res_P)[which.min(subset_res_P$padj)]
+
+topGene_T <- rownames(subset_res_T)[which.min(subset_res_T$padj)]
+
+topGene_T_st <- rownames(subset_res_T_st)[which.min(subset_res_T_st$padj)]
+topGene_S_st <- rownames(subset_res_S_st)[which.min(subset_res_S_st$padj)]
+
+
+print(topGene_S)
+print(topGene_P)
+print(topGene_T)
+
+
+
+```
+
+\
+
+## Gene with Lowest p-value: Population Contrast
+
+The gene ENSGACG00000020944 seems to have increased expression in RS vs Bt populations between the CV and GF Treatment groups. This gene, MT-ND3 is a mitochondrial NADH Dehydrogenase. \
+
+Stickleback fish are known to have two distinct mitochondrial haplotypes[1], and this changed expression of the gene in the 2 populations could be an indicator of this. \
+
+But to check whether this difference between populations is significant or not, we still have to check the statistical significance of this difference between the groups. \
+
+```{r, fig.align='center', echo=F,fig.height=3,fig.width=4}
+
+geneCounts_P <- plotCounts(dds_PST, gene = topGene_P, intgroup = c("Treatment","Population"),
+                         returnData = TRUE)
+ggplot(geneCounts_P, aes(x = Population, y = count, color = Population)) +
+  scale_y_log10() +  geom_beeswarm(cex = 3)+
+  ggtitle(paste("Expression of",topGene_P ))+ facet_wrap(~Treatment)
+
+```
+
+##  Gene with Lowest p-value: Treatment Contrast
+
+This was the same gene in both the designs. The gene ENSGACG00000017166 doesn't seem to be significantly different between Treatment groups in the 2 populations, despite having the lowest p-value. This gene is a myeloid-specific peroxidase and a study[2] shows it to be enriched in stickleback fish with conventional microbiota (CV). Our data also shows a similar trend.\
+
+This gene is associated with innate immunity pathways in stickleback fish, and the increased presence in the fish with conventional microbiota could be because of host-microbial interactions.\
+
+
+```{r, fig.align='center', echo=F,fig.height=3,fig.width=4}
+
+geneCounts_T <- plotCounts(dds_PST, gene = topGene_T, intgroup = c("Treatment","Sex","Population"),
+                         returnData = TRUE)
+ggplot(geneCounts_T, aes(x =Treatment, y = count, color = Treatment)) +
+  scale_y_log10() +  geom_beeswarm(cex = 3)+
+  ggtitle(paste("Expression of",topGene_T)) + facet_wrap(~Population)
+
+
+
+```
+
+##  Gene with Lowest p-value: Sex Contrast
+
+This was the same gene in both the designs. The gene ENSGACG00000007341 seems to have increased expression in F vs M sexes between the CV and GF Treatment groups. The gene is IREB2, this gene is an RNA-binding protein that acts to regulate iron levels in the cells by regulating the translation and stability of mRNAs that affect iron homeostasis under conditions when iron is depleted. \
+
+Maybe the females fishies need more iron??\
+
+
+```{r, fig.align='center', echo=F,fig.height=3,fig.width=4}
+
+geneCounts_S <- plotCounts(dds_PST, gene = topGene_S, intgroup = c("Treatment","Sex"), returnData = TRUE)
+
+ggplot(geneCounts_S, aes(x = Sex, y = count, color = Sex)) +
+  geom_beeswarm(cex = 3)+
+  ggtitle(paste("Expression of",topGene_S)) + facet_wrap(~Treatment)
+  
+
+```
+
+# MA-plot
+
+The lfcShrink looks at the largest fold changes that are not due to low counts and uses these to inform a prior distribution. So the large fold changes from genes with lots of statistical information are not shrunk, while the imprecise fold changes are shrunk. \
+
+An MA-plot provides a useful overview for the distribution of the estimated coefficients in the model, e.g. the comparisons of interest, across all genes. On the y-axis, the “M” stands for “minus” – subtraction of log values is equivalent to the log of the ratio – and on the x-axis, the “A” stands for “average”. The output from the lfcShrink function is passed onto this plot \
+
+```{r, echo=F, include=F}
+resultsNames(dds_PST)
+res1 <- lfcShrink(dds_PST, coef="Population_RS_vs_Bt", type="apeglm")
+
+res2 <- lfcShrink(dds_PST, coef="Sex_M_vs_F", type="apeglm")
+
+res3 <- lfcShrink(dds_PST, coef="Treatment_GF_vs_CV", type="apeglm")
+```
+
+
+```{r, fig.show="hold", out.width="50%", echo=F}
+
+p <- plotMA(res1, ylim = c(-5, 5),main = "Population RS vs Bt") 
+q <- plotMA(res2, ylim = c(-5, 5),main = "Sex M vs F")
+r <- plotMA(res3, ylim = c(-5, 5),main = "Treatment GF vs CV")
+
+
+
+
+```
+
+We can see from the plots above that the Population RS vs Bt contrast has the most genes with significant fold change (the points lying above 1 and below -1), and adjusted p-value < 0.1 (shown in blue). The Sex Male vs Female contrast has noticeably less genes, with only a few (<10) which have a significant fold change. The Treatment GF vs CV contrast has the least number of genes visualized and few of them (<10) have significant fold change.\
+
+# Distribution of p-values
+
+```{r, fig.show="hold", out.width="50%", echo=F}
+
+hist(res_T$pvalue[res_T$baseMean > 1], breaks = 0:20/20,main = "Distribution of p-values for Treatment Contrast",
+     col = "plum3",xlab = "P-value")
+
+hist(res_T$padj[res_T$baseMean > 1], breaks = 0:20/20,main = "Distribution of adjusted p-values Treatment Contrast", col = "plum3",xlab = "P-value")
+
+```
+
+We can see that the p-values for the Treatment groups showed a uniform distribution. This indicates that the null hypothesis is true, i.e, the difference in gene expression between CV and GF Treatment groups does not vary significantly. This is further substantiated by our adjusted p-value plots which show that there are very less genes with low p-values. \
+
+```{r, fig.show="hold", out.width="50%", echo=F}
+
+hist(res_P$pvalue[res_P$baseMean > 1], breaks = 0:20/20,main = "Distribution of p-values for Population Contrast",
+     col = "plum3",xlab = "P-value")
+
+hist(res_P$padj[res_P$baseMean > 1], breaks = 0:20/20,main = "Distribution of p-values for Population Contrast",
+     col = "plum3",xlab = "P-value")
+
+```
+
+We can see that the p-values for the Population groups showed majority of the genes having a very low p-value. And this is substantiated by the adjusted p-value plots as well. This indicates that there could potentially be a significant difference in gene expressions between the Populations. \
+
+```{r, echo=F,include=F}
+
+topVarGenes_PST <- head(order(rowVars(assay(rld_PST)), decreasing = TRUE), 50)
+topVarGenes_ST <- head(order(rowVars(assay(rld_ST)), decreasing = TRUE), 50)
+ 
+table(rownames(assay(rld_PST)[topVarGenes_PST, ]) %in% rownames(assay(rld_ST)[topVarGenes_ST, ]))
+
+table(rownames(assay(rld_ST)[topVarGenes_ST, ]) %in% rownames(assay(rld_PST)[topVarGenes_PST, ]))
+
+
+rownames(assay(rld_ST)[topVarGenes_ST, ])[which(!(rownames(assay(rld_ST)[topVarGenes_ST, ]) %in% rownames(assay(rld_PST)[topVarGenes_PST, ])))]
+         
+rownames(assay(rld_PST)[topVarGenes_PST, ])[which(!(rownames(assay(rld_PST)[topVarGenes_PST, ]) %in% rownames(assay(rld_ST)[topVarGenes_ST, ])))]
+         
+```
+
+# Heatmaps
+
+The heatmaps show no perfect clustering of samples for Sex or Treatment. For Population, a lot of the samples from Bt cluster together; these genes are conserved in 10/16 of the Bt population. The 10 samples which cluster together are conserved in both the PST and ST models.\
+
+```{r, echo=F, fig.show="hold", out.width="50%",echo=F,fig.height=10}
+
+mat  <- assay(rld_PST)[topVarGenes_PST, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(rld_PST)[, c("Population","Treatment","Sex")])
+pheatmap(mat, annotation_col = anno,fontsize_row = 5,fontsize_col = 5,main = "PST Design Top 50 Gene Expression")
+
+mat  <- assay(rld_ST)[topVarGenes_ST, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(rld_ST)[, c("Population","Treatment","Sex")])
+pheatmap(mat, annotation_col = anno,fontsize_row  = 5,fontsize_col = 5,main = "ST Design Top 50 Gene Expression")
+
+```
+
+
+There are 2 genes which are different between the PST vs ST designs of the top 50 genes above. \
+
+       PST                    ST
+-------------------- ---------------------
+ ENSGACG00000001516   ENSGACG00000004479
+ ENSGACG00000012498   ENSGACG00000011274
+
+We can see that the 2 PST genes have very high expression in sample 4C_04.\
+
+These genes could be lost in the ST model; it could have been removed when we were filtering out genes which weren't present in at least a number of samples equal to the smallest group.
+The smallest group size in the ST model was 7 and 3 in the PST model.
+
+These 2 genes are probably only expressed in 3-6 of the samples.
+
+From these plots, once again we can infer that this 5C_02 sample is an outlier and might be messing up the results for the differential expression analyses. For future purposes, removing this sample might help getting better results. \
+
+# Barplot showing total counts of up and down expressed genes
+
+The germ-free ("GF") group shows more downregulated genes** than upregulated as compared to the conventional microbiota (“CV”) group. \
+
+**When I say downregulated / upregulated, it is not an accurate use of the term as we didn't filter for a significant fold change, just Negative or Positive values. Adjusted P-value is also <0.1 only. \
+
+
+```{r, echo=F, fig.show="hold", out.width="50%",fig.align='center'}
+
+up_degs<- rownames(subset_res_T)[which(subset_res_T$log2FoldChange>0)]
+
+down_degs <-rownames(subset_res_T)[which(subset_res_T$log2FoldChange<(0))]
+
+up_degs_ST<- rownames(subset_res_T_st)[which(subset_res_T_st$log2FoldChange>0)]
+
+down_degs_ST <- rownames(subset_res_T_st)[which(subset_res_T_st$log2FoldChange<0)]
+
+
+
+data.frame(Expression = factor(c("Positive","Negative","Positive","Negative"),levels=c("Positive","Negative")), `Number of Genes`=c(length(up_degs),length(down_degs),length(up_degs_ST),length(down_degs_ST)), Model=c("Full","Full","Reduced","Reduced")) %>% 
+  
+  ggplot(aes(x =Model, y = Number.of.Genes, fill = Expression)) +
+  geom_bar( stat = "identity",position = "dodge",width = 0.5) + 
+  ggtitle("Fold Change sign of genes with p < 0.1 in GF vs CV")+
+  theme_bw()+
+  xlab("Fold Change Sign") +
+  ylab("Number of Genes") +
+  theme(plot.title = element_text(hjust = 0.5)) +theme(plot.title = element_text(hjust = 0.5)) +
+  geom_text(aes(label =Number.of.Genes,y= Number.of.Genes), stat = "identity", position=position_dodge(width=0.5), vjust=-0.5)+ labs(fill='Fold Change Sign') + lims(y = c(0, 70))
+
+
+
+```
+
+
+# Explaining differences between the 2 Designs
+
+A design formula tells the statistical software which sources of variation to test for. This includes both our factor of interest, which is Treatment, as well as any additional covariates (Sex and Population) that are sources of variation. In our data we know that Population is a significant source of variation, hence, Population should be included in our model. \
+
+The ST (Sex and Treatment) model doesn't account for the Population as a confounding variable.\
+
+The reduced model (ST) is trying to group the samples from different populations, which clearly have differences in expression levels, together. Hence, the number of genes which seem to show different expression levels** between Treatment groups or Sex is lesser than compared to the full model (PST) above. \
+
+**(which may not be significant differential expression!! the adjusted p-value we choose is only 0.1!! and we haven't accounted for fold change!) \
+
+When comparing the actual genes with adjusted p-value less than 1 between the models: \
+
+```{r,echo=F, include=F}
+
+table(rownames(subset_res_T_st) %in% rownames(subset_res_T))
+table(rownames(subset_res_S_st) %in% rownames(subset_res_S))
+
+
+```
+
+43/48 and 577/592 of the genes in the Treatment and Sex contrasts respectively are conserved between models.
+
+This shows that the DEGs in the 2 contrasts (Sex and Treatment) are largely the same, regardless whether we take into consideration Population as a confounding variable. \
+
+Majority of the plots are hence conserved/very similar between these 2 designs. \
+
+These also could be *interesting* genes! >.< \
+
+# References
+
+[1] Beck, Emily A., Susan Bassham, and William A. Cresko. "Extreme intraspecific divergence in mitochondrial haplotypes makes the threespine stickleback fish an emerging evolutionary mutant model for mito-nuclear interactions." *Frontiers in Genetics* 13 (2022): 925786.
+
+[2] Small, Clayton M., et al. "Host genotype and microbiota contribute asymmetrically to transcriptional variation in the threespine stickleback gut." *Genome biology and evolution* 9.3 (2017): 504-520.
